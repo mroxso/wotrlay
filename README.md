@@ -42,6 +42,7 @@ Configuration is loaded from environment variables in [`main.go`](main.go:33):
 
 - `MID_THRESHOLD` (default: 0.5) - trust score above which all kinds are allowed
 - `HIGH_THRESHOLD` (optional) - trust score above which backfill is free; if not set, there is no distinct high tier and all pubkeys with `r ≥ midThreshold` get maximum rate
+- `URL_POLICY_ENABLED` (optional) - enables URL restriction for users below `MID_THRESHOLD`
 - `RANK_QUEUE_IP_DAILY_LIMIT` (default: 250) - max rank refresh requests per day per IP group
 - `RELATR_RELAY` (default: wss://relay.contextvm.org) - ContextVM relay URL for rank lookups
 - `RELATR_PUBKEY` (default: 750682303c9f0ddad75941b49edc9d46e3ed306b9ee3335338a21a3e404c5fa3) - Relatr service pubkey
@@ -59,6 +60,8 @@ Create a `.env` file or set environment variables:
 export MID_THRESHOLD=0.5
 # HIGH_THRESHOLD is optional - omit to use 3-tier system (no high tier)
 # export HIGH_THRESHOLD=0.9  # uncomment to enable 4-tier system with backfill
+# URL_POLICY_ENABLED is optional - enable to restrict URLs below MID_THRESHOLD
+# export URL_POLICY_ENABLED="true"  # truthy: true/1/yes/on (case-insensitive)
 export RANK_QUEUE_IP_DAILY_LIMIT=250
 export RELATR_RELAY="wss://relay.contextvm.org"
 export RELATR_PUBKEY="750682303c9f0ddad75941b49edc9d46e3ed306b9ee3335338a21a3e404c5fa3"
@@ -105,6 +108,7 @@ The relay returns typed errors for event rejections that can be used for client-
 - `ErrKindNotAllowed` - Non-Kind-1 events from pubkeys below `MID_THRESHOLD`
 - `ErrInvalidTimestamp` - Events with timestamps >24h in the future
 - `ErrRateLimited` - Pubkey has exceeded their rate limit
+- `ErrURLNotAllowed` - Kind 1 events with URLs from pubkeys below `MID_THRESHOLD` (only when `URL_POLICY_ENABLED=true`)
 
 ### Rank Cache Behavior
 
@@ -140,6 +144,7 @@ observability: rate_limited=5 kind_not_allowed=2 invalid_timestamp=1 cache_hits=
 - `rate_limited` - Number of events rejected due to rate limiting
 - `kind_not_allowed` - Number of events rejected due to kind gating
 - `invalid_timestamp` - Number of events rejected due to future timestamps
+- `url_not_allowed` - Number of events rejected due to URL policy
 - `cache_hits` - Number of rank cache hits
 - `cache_misses` - Number of rank cache misses
 

@@ -10,11 +10,13 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/fiatjaf/eventstore/badger"
+	"github.com/joho/godotenv"
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/pippellia-btc/rely"
 )
@@ -27,6 +29,9 @@ type Config struct {
 	// HighThreshold: trust score above which backfill is free and max rate applies
 	// If nil, there is no distinct high tier and high-threshold policies apply to all values exceeding midThreshold
 	HighThreshold *float64
+
+	// URLPolicyEnabled: whether to enforce URL restriction for users below MidThreshold
+	URLPolicyEnabled bool
 
 	// RankQueueIPDailyLimit: max rank refresh requests per day per IP group
 	RankQueueIPDailyLimit float64
@@ -61,6 +66,7 @@ var (
 	ErrKindNotAllowed   = errors.New("kind-not-allowed: just Kind 1 events")
 	ErrInvalidTimestamp = errors.New("invalid-timestamp: event timestamp is too far in the future")
 	ErrRateLimited      = errors.New("rate-limited: please try again later")
+	ErrURLNotAllowed    = errors.New("url-not-allowed: only text notes without URLs")
 )
 
 // Observability tracks operational metrics for monitoring and debugging.
@@ -68,12 +74,21 @@ type Observability struct {
 	rateLimitedCount      atomic.Uint64
 	kindNotAllowedCount   atomic.Uint64
 	invalidTimestampCount atomic.Uint64
+	urlNotAllowedCount    atomic.Uint64
 	rankCacheHits         atomic.Uint64
 	rankCacheMisses       atomic.Uint64
 }
 
 // loadConfig loads configuration from environment variables with defaults and validation.
 func loadConfig() Config {
+	// Best-effort load of .env into process environment.
+	// Without this, variables set in a local .env file won't be visible to os.Getenv
+	// unless the process environment is populated externally (e.g. `export ...`).
+	//
+	// Note: ignore errors so production/container deployments that don't ship a .env
+	// file keep working.
+	_ = godotenv.Load()
+
 	// Get HighThreshold as optional parameter
 	var highThreshold *float64
 	if value := os.Getenv("HIGH_THRESHOLD"); value != "" {
@@ -87,6 +102,7 @@ func loadConfig() Config {
 	cfg := Config{
 		MidThreshold:          getEnvFloat("MID_THRESHOLD", 0.5),
 		HighThreshold:         highThreshold,
+		URLPolicyEnabled:      getEnvBool("URL_POLICY_ENABLED", false),
 		RankQueueIPDailyLimit: getEnvFloat("RANK_QUEUE_IP_DAILY_LIMIT", 250),
 		RelatrRelay:           getEnvString("RELATR_RELAY", "wss://relay.contextvm.org"),
 		RelatrPubkey:          getEnvString("RELATR_PUBKEY", "750682303c9f0ddad75941b49edc9d46e3ed306b9ee3335338a21a3e404c5fa3"),
@@ -135,6 +151,27 @@ func getEnvString(key, defaultValue string) string {
 	return defaultValue
 }
 
+// getEnvBool reads a boolean from environment variable with a default value.
+// Accepted true values: "true", "1", "yes", "on" (case-insensitive).
+// Accepted false values: "false", "0", "no", "off" (case-insensitive).
+// Any other non-empty value falls back to defaultValue.
+func getEnvBool(key string, defaultValue bool) bool {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return defaultValue
+	}
+
+	switch strings.ToLower(value) {
+	case "true", "1", "yes", "on":
+		return true
+	case "false", "0", "no", "off":
+		return false
+	default:
+		log.Printf("Invalid value for %s: %s, using default: %t", key, value, defaultValue)
+		return defaultValue
+	}
+}
+
 func main() {
 	// Load configuration
 	cfg := loadConfig()
@@ -160,7 +197,7 @@ func main() {
 	// Start periodic observability logging if debug is enabled
 	if cfg.Debug {
 		go func() {
-			ticker := time.NewTicker(30 * time.Second)
+			ticker := time.NewTicker(30 * time.Minute)
 			defer ticker.Stop()
 			for {
 				select {
@@ -206,6 +243,12 @@ func handleEvent(ctx context.Context, c rely.Client, e *nostr.Event, cfg Config,
 	if rank < cfg.MidThreshold && e.Kind != 1 {
 		obs.kindNotAllowedCount.Add(1)
 		return ErrKindNotAllowed
+	}
+
+	// 3.5. URL policy: no URLs allowed for users below mid threshold
+	if cfg.URLPolicyEnabled && rank < cfg.MidThreshold && e.Kind == 1 && ContainsURL(e.Content) {
+		obs.urlNotAllowedCount.Add(1)
+		return ErrURLNotAllowed
 	}
 
 	// 4. Timestamp sanity: reject events too far in the future
@@ -337,9 +380,10 @@ func logObservability(obs *Observability) {
 	rateLimited := obs.rateLimitedCount.Load()
 	kindNotAllowed := obs.kindNotAllowedCount.Load()
 	invalidTimestamp := obs.invalidTimestampCount.Load()
+	urlNotAllowed := obs.urlNotAllowedCount.Load()
 	cacheHits := obs.rankCacheHits.Load()
 	cacheMisses := obs.rankCacheMisses.Load()
 
-	log.Printf("observability: rate_limited=%d kind_not_allowed=%d invalid_timestamp=%d cache_hits=%d cache_misses=%d",
-		rateLimited, kindNotAllowed, invalidTimestamp, cacheHits, cacheMisses)
+	log.Printf("observability: rate_limited=%d kind_not_allowed=%d invalid_timestamp=%d url_not_allowed=%d cache_hits=%d cache_misses=%d",
+		rateLimited, kindNotAllowed, invalidTimestamp, urlNotAllowed, cacheHits, cacheMisses)
 }

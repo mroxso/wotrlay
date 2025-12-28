@@ -1,2 +1,4 @@
 badger
 docs
+.env
+go.sum
