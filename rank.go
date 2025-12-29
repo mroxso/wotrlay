@@ -195,7 +195,7 @@ func (c *RankCache) GetRank(ctx context.Context, pubkey string) (float64, error)
 	}
 
 	// Not in cache or stale, use singleflight to deduplicate
-	_, err, _ := c.flight.Do(pubkey, func() (interface{}, error) {
+	_, err, _ := c.flight.Do(pubkey, func() (any, error) {
 		if err := c.refreshBatch(ctx, []string{pubkey}); err != nil {
 			// On failure, cache rank=0 to avoid repeated lookups
 			c.Update(time.Now(), PubRank{Pubkey: pubkey, Rank: 0})

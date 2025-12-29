@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -18,6 +19,7 @@ import (
 	"github.com/fiatjaf/eventstore/badger"
 	"github.com/joho/godotenv"
 	"github.com/nbd-wtf/go-nostr"
+	"github.com/nbd-wtf/go-nostr/nip11"
 	"github.com/pippellia-btc/rely"
 )
 
@@ -47,6 +49,14 @@ type Config struct {
 
 	// Debug: whether to enable verbose debug logging
 	Debug bool
+
+	// NIP-11 Relay Information Document configuration
+	RelayName        string
+	RelayDescription string
+	RelayPubKey      string
+	RelayContact     string
+	Software         string
+	Version          string
 }
 
 // Timestamp sanity window: reject events >24h in the future
@@ -108,6 +118,13 @@ func loadConfig() Config {
 		RelatrPubkey:          getEnvString("RELATR_PUBKEY", "750682303c9f0ddad75941b49edc9d46e3ed306b9ee3335338a21a3e404c5fa3"),
 		RelatrSecretKey:       os.Getenv("RELATR_SECRET_KEY"),
 		Debug:                 os.Getenv("DEBUG") != "",
+		// NIP-11 Relay Information Document configuration
+		RelayName:        getEnvString("RELAY_NAME", "wotrlay"),
+		RelayDescription: getEnvString("RELAY_DESCRIPTION", "A Web-of-Trust (WoT) based Nostr relay with reputation-driven rate limiting"),
+		RelayPubKey:      getEnvString("RELAY_PUBKEY", ""),
+		RelayContact:     getEnvString("RELAY_CONTACT", ""),
+		Software:         getEnvString("SOFTWARE", "https://github.com/contextvm/wotrlay"),
+		Version:          getEnvString("VERSION", "0.1.0"),
 	}
 
 	// Validate thresholds
@@ -172,6 +189,26 @@ func getEnvBool(key string, defaultValue bool) bool {
 	}
 }
 
+// createRelayInfoDocument creates a NIP-11 compliant relay information document
+// based on the configuration
+func createRelayInfoDocument(cfg Config) nip11.RelayInformationDocument {
+	// Build supported NIPs list
+	supportedNIPs := []any{1, 11} // Always support NIP-01 and NIP-11
+
+	// Create the relay information document
+	info := nip11.RelayInformationDocument{
+		Name:          cfg.RelayName,
+		Description:   cfg.RelayDescription,
+		PubKey:        cfg.RelayPubKey,
+		Contact:       cfg.RelayContact,
+		SupportedNIPs: supportedNIPs,
+		Software:      cfg.Software,
+		Version:       cfg.Version,
+	}
+
+	return info
+}
+
 func main() {
 	// Load configuration
 	cfg := loadConfig()
@@ -210,8 +247,12 @@ func main() {
 		}()
 	}
 
+	// Create NIP-11 relay information document
+	relayInfo := createRelayInfoDocument(cfg)
+
 	relay := rely.NewRelay(
 		rely.WithDomain("relay.example.com"),
+		rely.WithInfo(relayInfo),
 	)
 
 	// No NIP-42 auth requirement - rate limiting is based on event.PubKey
@@ -224,8 +265,65 @@ func main() {
 		return Query(ctx, c, f, &db, cfg.Debug)
 	}
 
-	if err := relay.StartAndServe(ctx, "localhost:3334"); err != nil {
-		log.Fatalf("server error: %v", err)
+	// Start the relay (non-blocking)
+	relay.Start(ctx)
+
+	// Create a custom handler that routes requests appropriately
+	router := http.NewServeMux()
+
+	// Serve favicon
+	router.HandleFunc("/favicon.ico", serveFavicon())
+
+	// Custom root handler that delegates to HTML or relay based on request type
+	router.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Route WebSocket and NIP-11 requests to the relay
+		if r.Header.Get("Upgrade") == "websocket" || r.Header.Get("Accept") == "application/nostr+json" {
+			relay.ServeHTTP(w, r)
+			return
+		}
+		
+		// For all other requests to root path, serve HTML
+		if r.URL.Path == "/" && r.Method == http.MethodGet {
+			serveHTMLPage(cfg, relayInfo)(w, r)
+			return
+		}
+		
+		// Let relay handle everything else
+		relay.ServeHTTP(w, r)
+	}))
+
+	// Create HTTP server with custom router
+	server := &http.Server{
+		Addr:    "localhost:3334",
+		Handler: router,
+	}
+	exitErr := make(chan error, 1)
+
+	// Start the server
+	go func() {
+		log.Printf("Starting wotrlay relay on %s", server.Addr)
+		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			exitErr <- err
+		}
+	}()
+
+	// Wait for shutdown signal or server error
+	select {
+	case <-ctx.Done():
+		// Graceful shutdown
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+
+		err := server.Shutdown(shutdownCtx)
+		relay.Wait() // Wait for relay to close all connections
+		if err != nil {
+			log.Printf("Server shutdown error: %v", err)
+		} else {
+			log.Printf("Server shutdown complete")
+		}
+
+	case err := <-exitErr:
+		log.Fatalf("Server error: %v", err)
 	}
 }
 
