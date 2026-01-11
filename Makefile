@@ -155,21 +155,6 @@ vet:
 	@go vet ./...
 	@echo "Vet complete"
 
-## lint: Run linter (requires golangci-lint)
-lint:
-	@echo "Running linter..."
-	@if command -v golangci-lint >/dev/null 2>&1; then \
-		golangci-lint run ./...; \
-	else \
-		echo "golangci-lint not installed. Install with: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest"; \
-	fi
-
 ## check: Run all checks (fmt, vet, test)
 check: fmt vet test
 	@echo "All checks passed!"
-
-## install: Install binary to GOPATH
-install: build
-	@echo "Installing $(BINARY_NAME) to GOPATH..."
-	@go install .
-	@echo "Installed: $$(which $(BINARY_NAME))"

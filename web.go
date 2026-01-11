@@ -14,7 +14,7 @@ import (
 func generateFavicon() []byte {
 	// Create a 16x16 image
 	img := image.NewRGBA(image.Rect(0, 0, 16, 16))
-	
+
 	// Fill with a nice blue color (#3498db)
 	bgColor := color.RGBA{52, 152, 219, 255}
 	for y := range 16 {
@@ -22,7 +22,7 @@ func generateFavicon() []byte {
 			img.Set(x, y, bgColor)
 		}
 	}
-	
+
 	// Add a simple white bucket shape in the center
 	textColor := color.RGBA{255, 255, 255, 255}
 	// Bucket shape: wider at top, narrower at bottom
@@ -38,11 +38,11 @@ func generateFavicon() []byte {
 		// Handle
 		{3, 6}, {2, 7}, {2, 8},
 	}
-	
+
 	for _, pos := range positions {
 		img.Set(pos.x, pos.y, textColor)
 	}
-	
+
 	// Encode to PNG
 	var buf bytes.Buffer
 	png.Encode(&buf, img)

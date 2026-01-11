@@ -45,6 +45,9 @@ type Config struct {
 	// RankQueueIPDailyLimit: max rank refresh requests per day per IP group
 	RankQueueIPDailyLimit float64
 
+	// RankCacheSize: maximum number of entries in rank cache (default: 100000)
+	RankCacheSize int
+
 	// RelatrRelay: ContextVM relay URL for rank lookups
 	RelatrRelay string
 
@@ -78,13 +81,23 @@ const secondsPerDay = 86400
 // rankQueueKeyPrefix is the prefix for rank-queue rate limiter keys
 const rankQueueKeyPrefix = "rank-queue:"
 
-// Sentinel errors for event rejection reasons
+// Sentinel errors for event rejection reasons.
+// Error strings should not be capitalized or end with punctuation.
 var (
-	ErrKindNotAllowed   = errors.New("kind-not-allowed: just Kind 1 events")
+	ErrKindNotAllowed   = errors.New("kind-not-allowed: just kind 1 events")
 	ErrInvalidTimestamp = errors.New("invalid-timestamp: event timestamp is too far in the future")
 	ErrRateLimited      = errors.New("rate-limited: please try again later")
 	ErrURLNotAllowed    = errors.New("url-not-allowed: only text notes without URLs")
 )
+
+// exemptKinds are event kinds that bypass rate limiting and kind gating.
+var exemptKinds = map[int]bool{
+	0:     true,
+	3:     true,
+	10002: true,
+	10040: true,
+	30382: true,
+}
 
 // Observability tracks operational metrics for monitoring and debugging.
 type Observability struct {
@@ -120,7 +133,8 @@ func loadConfig() Config {
 		MidThreshold:          getEnvFloat("MID_THRESHOLD", 0.5),
 		HighThreshold:         highThreshold,
 		URLPolicyEnabled:      getEnvBool("URL_POLICY_ENABLED", false),
-		RankQueueIPDailyLimit: getEnvFloat("RANK_QUEUE_IP_DAILY_LIMIT", 250),
+		RankQueueIPDailyLimit: getEnvFloat("RANK_QUEUE_IP_DAILY_LIMIT", 1000),
+		RankCacheSize:         getEnvInt("RANK_CACHE_SIZE", 100000),
 		RelatrRelay:           getEnvString("RELATR_RELAY", "wss://relay.contextvm.org"),
 		RelatrPubkey:          getEnvString("RELATR_PUBKEY", "750682303c9f0ddad75941b49edc9d46e3ed306b9ee3335338a21a3e404c5fa3"),
 		RelatrSecretKey:       os.Getenv("RELATR_SECRET_KEY"),
@@ -156,7 +170,7 @@ func loadConfig() Config {
 	return cfg
 }
 
-// getEnvFloat reads a float64 from environment variable with a default value
+// getEnvFloat reads a float64 from environment variable with a default value.
 func getEnvFloat(key string, defaultValue float64) float64 {
 	if value := os.Getenv(key); value != "" {
 		if parsed, err := strconv.ParseFloat(value, 64); err == nil {
@@ -167,7 +181,7 @@ func getEnvFloat(key string, defaultValue float64) float64 {
 	return defaultValue
 }
 
-// getEnvString reads a string from environment variable with a default value
+// getEnvString reads a string from environment variable with a default value.
 func getEnvString(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
@@ -196,8 +210,19 @@ func getEnvBool(key string, defaultValue bool) bool {
 	}
 }
 
+// getEnvInt reads an int from environment variable with a default value.
+func getEnvInt(key string, defaultValue int) int {
+	if value := os.Getenv(key); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil {
+			return parsed
+		}
+		log.Printf("Invalid value for %s: %s, using default: %d", key, value, defaultValue)
+	}
+	return defaultValue
+}
+
 // createRelayInfoDocument creates a NIP-11 compliant relay information document
-// based on the configuration
+// based on the configuration.
 func createRelayInfoDocument(cfg Config) nip11.RelayInformationDocument {
 	// Build supported NIPs list
 	supportedNIPs := []any{1, 11} // Always support NIP-01 and NIP-11
@@ -291,21 +316,25 @@ func main() {
 			relay.ServeHTTP(w, r)
 			return
 		}
-		
+
 		// For all other requests to root path, serve HTML
 		if r.URL.Path == "/" && r.Method == http.MethodGet {
 			serveHTMLPage(cfg, relayInfo)(w, r)
 			return
 		}
-		
+
 		// Let relay handle everything else
 		relay.ServeHTTP(w, r)
 	}))
 
-	// Create HTTP server with custom router
+	// Create HTTP server with custom router and proper timeouts.
+	// Timeouts prevent resource exhaustion from slow clients.
 	server := &http.Server{
-		Addr:    "0.0.0.0:3334",
-		Handler: router,
+		Addr:         "0.0.0.0:3334",
+		Handler:      router,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 	exitErr := make(chan error, 1)
 
@@ -337,9 +366,21 @@ func main() {
 	}
 }
 
-// handleEvent implements the v2 event handling flow
+// handleEvent implements the v2 event handling flow.
 func handleEvent(ctx context.Context, c rely.Client, e *nostr.Event, cfg Config, cache *RankCache, limiter *Limiter, db *badger.BadgerBackend, obs *Observability) error {
 	now := time.Now()
+
+	// 0. Exempt kinds bypass all rate limiting and kind gating
+	if exemptKinds[e.Kind] {
+		// Only timestamp sanity check applies to exempt kinds
+		eventTime := time.Unix(int64(e.CreatedAt), 0)
+		if eventTime.Sub(now) > timestampSanityWindow {
+			obs.invalidTimestampCount.Add(1)
+			return ErrInvalidTimestamp
+		}
+		// Save exempt kind events directly
+		return Save(ctx, e, db, cfg.Debug)
+	}
 
 	// 1. Extract pubkey
 	pubkey := e.PubKey
@@ -391,7 +432,7 @@ func handleEvent(ctx context.Context, c rely.Client, e *nostr.Event, cfg Config,
 	return Save(ctx, e, db, cfg.Debug)
 }
 
-// calculateDailyRate returns the target allowed events per day based on trust score
+// calculateDailyRate returns the target allowed events per day based on trust score.
 func calculateDailyRate(r float64, cfg Config) float64 {
 	switch {
 	case r <= 0:
@@ -411,8 +452,11 @@ func calculateDailyRate(r float64, cfg Config) float64 {
 
 // lookupRank returns the rank for a pubkey, performing a best-effort refresh on cache miss.
 // It gates refresh attempts by IP group to protect rank provider from abuse.
+// Preserves stale cache data when IP is rate-limited or refresh fails.
 func lookupRank(ctx context.Context, c rely.Client, e *nostr.Event, cfg Config, cache *RankCache, limiter *Limiter, obs *Observability) float64 {
 	pubkey := e.PubKey
+
+	// Try cache first
 	rank, exists := cache.Rank(pubkey)
 	if exists {
 		return rank
@@ -427,11 +471,25 @@ func lookupRank(ctx context.Context, c rely.Client, e *nostr.Event, cfg Config, 
 		if refreshed, err := cache.GetRank(refreshCtx, pubkey); err == nil {
 			return refreshed
 		}
-		// Best-effort fallback: enqueue for async refresh and proceed with rank=0
+		// Refresh failed - check if we have stale data preserved
+		if rank, exists := cache.Rank(pubkey); exists {
+			if cfg.Debug {
+				log.Printf("using stale rank %f for %s (refresh failed)", rank, pubkey)
+			}
+			return rank
+		}
+		// No stale data, enqueue for async refresh and proceed with rank=0
 		cache.tryEnqueue(pubkey)
 	} else {
+		// IP rate-limited - check if we have stale data preserved
+		if rank, exists := cache.Rank(pubkey); exists {
+			if cfg.Debug {
+				log.Printf("IP rate-limited for %s, using stale rank %f", ipGroup, rank)
+			}
+			return rank
+		}
 		if cfg.Debug {
-			log.Printf("rank-queue rate-limited for IP %s, skipping refresh", ipGroup)
+			log.Printf("rank-queue rate-limited for IP %s, no stale data available", ipGroup)
 		}
 	}
 	return 0
@@ -452,7 +510,7 @@ func Save(ctx context.Context, e *nostr.Event, db *badger.BadgerBackend, debug b
 	return nil
 }
 
-// Query handles REQ messages by querying the event store
+// Query handles REQ messages by querying the event store.
 func Query(ctx context.Context, c rely.Client, f nostr.Filters, db *badger.BadgerBackend, debug bool) ([]nostr.Event, error) {
 	if debug {
 		log.Printf("received filters %v", f)
@@ -482,7 +540,7 @@ func Query(ctx context.Context, c rely.Client, f nostr.Filters, db *badger.Badge
 	return events, nil
 }
 
-// logObservability prints current counter values for debugging/monitoring
+// logObservability prints current counter values for debugging/monitoring.
 func logObservability(obs *Observability) {
 	// Load atomically to avoid race conditions
 	rateLimited := obs.rateLimitedCount.Load()

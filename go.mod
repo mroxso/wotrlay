@@ -4,6 +4,8 @@ go 1.24.1
 
 require (
 	github.com/fiatjaf/eventstore v0.17.5
+	github.com/hashicorp/golang-lru/v2 v2.0.7
+	github.com/joho/godotenv v1.5.1
 	github.com/nbd-wtf/go-nostr v0.52.3
 	github.com/pippellia-btc/rely v1.2.1
 	golang.org/x/sync v0.19.0
@@ -30,7 +32,6 @@ require (
 	github.com/goccy/go-json v0.10.5 // indirect
 	github.com/google/flatbuffers v25.9.23+incompatible // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
-	github.com/joho/godotenv v1.5.1 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/klauspost/compress v1.18.1 // indirect

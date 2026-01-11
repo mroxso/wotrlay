@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/nbd-wtf/go-nostr"
 	"golang.org/x/sync/singleflight"
 )
@@ -23,8 +24,9 @@ var jsonRequestPool = sync.Pool{
 }
 
 type RankCache struct {
-	mu      sync.RWMutex
-	ranks   map[string]TimeRank
+	// LRU cache (thread-safe, no external mutex needed)
+	lru *lru.Cache[string, TimeRank]
+
 	refresh chan string
 
 	StaleThreshold     time.Duration
@@ -41,9 +43,6 @@ type RankCache struct {
 
 	// Single-flight group to prevent duplicate network requests
 	flight singleflight.Group
-
-	// lastClean tracks when the last eviction scan was performed
-	lastClean time.Time
 
 	// Observability metrics
 	obs *Observability
@@ -100,15 +99,25 @@ type jsonRPCResponse struct {
 }
 
 func NewRankCache(ctx context.Context, cfg Config, obs *Observability) *RankCache {
+	// Create LRU cache with size limit
+	cacheSize := 100000
+	if cfg.RankCacheSize > 0 {
+		cacheSize = cfg.RankCacheSize
+	}
+
+	lruCache, err := lru.New[string, TimeRank](cacheSize)
+	if err != nil {
+		log.Fatalf("failed to create LRU cache: %v", err)
+	}
+
 	cache := &RankCache{
-		ranks:              make(map[string]TimeRank, 100),
+		lru:                lruCache,
 		refresh:            make(chan string, 100),
 		StaleThreshold:     24 * time.Hour,
 		MaxRefreshInterval: 7 * 24 * time.Hour,
 		relatrRelay:        cfg.RelatrRelay,
 		relatrPubkey:       cfg.RelatrPubkey,
 		relatrSecretKey:    cfg.RelatrSecretKey,
-		lastClean:          time.Now(),
 		obs:                obs,
 	}
 
@@ -154,9 +163,8 @@ func (c *RankCache) dropRelay() {
 // If the rank is too old, its pubkey is sent to the refresher queue.
 // This is a non-blocking call suitable for hot paths.
 func (c *RankCache) Rank(pubkey string) (float64, bool) {
-	c.mu.RLock()
-	rank, exists := c.ranks[pubkey]
-	c.mu.RUnlock()
+	// LRU cache is thread-safe, no mutex needed
+	rank, exists := c.lru.Get(pubkey)
 
 	if !exists {
 		c.obs.rankCacheMisses.Add(1)
@@ -186,10 +194,7 @@ func (c *RankCache) tryEnqueue(pubkey string) {
 // Uses singleflight to prevent duplicate network requests.
 func (c *RankCache) GetRank(ctx context.Context, pubkey string) (float64, error) {
 	// First check cache
-	c.mu.RLock()
-	rank, exists := c.ranks[pubkey]
-	c.mu.RUnlock()
-
+	rank, exists := c.lru.Get(pubkey)
 	if exists && time.Since(rank.Timestamp) <= c.StaleThreshold {
 		return rank.Rank, nil
 	}
@@ -197,24 +202,32 @@ func (c *RankCache) GetRank(ctx context.Context, pubkey string) (float64, error)
 	// Not in cache or stale, use singleflight to deduplicate
 	_, err, _ := c.flight.Do(pubkey, func() (any, error) {
 		if err := c.refreshBatch(ctx, []string{pubkey}); err != nil {
-			// On failure, cache rank=0 to avoid repeated lookups
-			c.Update(time.Now(), PubRank{Pubkey: pubkey, Rank: 0})
+			// KEY CHANGE: Preserve existing data on failure
+			if exists {
+				// Have stale data, keep it instead of overwriting with 0
+				// Debug logging is done at the call site (lookupRank) where cfg is available
+			} else {
+				// No previous data, cache as 0
+				c.lru.Add(pubkey, TimeRank{Rank: 0, Timestamp: time.Now()})
+			}
 			return nil, fmt.Errorf("failed to refresh rank: %w", err)
 		}
 		return nil, nil
 	})
 
 	if err != nil {
+		if exists {
+			// Return stale rank instead of 0
+			return rank.Rank, nil
+		}
 		return 0, err
 	}
-	// Check cache again after refresh
-	c.mu.RLock()
-	rank, exists = c.ranks[pubkey]
-	c.mu.RUnlock()
 
+	// Check cache again after refresh
+	rank, exists = c.lru.Get(pubkey)
 	if !exists {
-		// If still not in cache after successful refresh, cache as rank=0
-		c.Update(time.Now(), PubRank{Pubkey: pubkey, Rank: 0})
+		// Should not happen, but be safe
+		c.lru.Add(pubkey, TimeRank{Rank: 0, Timestamp: time.Now()})
 		return 0, nil
 	}
 
@@ -224,9 +237,7 @@ func (c *RankCache) GetRank(ctx context.Context, pubkey string) (float64, error)
 // Update uses the provided ranks to update the cache.
 // Ranks are clamped to [0,1] to ensure valid values.
 func (c *RankCache) Update(ts time.Time, ranks ...PubRank) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
+	// LRU is thread-safe, no mutex needed
 	for _, r := range ranks {
 		// Clamp rank to valid range [0,1]
 		if r.Rank < 0 {
@@ -234,7 +245,7 @@ func (c *RankCache) Update(ts time.Time, ranks ...PubRank) {
 		} else if r.Rank > 1 {
 			r.Rank = 1
 		}
-		c.ranks[r.Pubkey] = TimeRank{Rank: r.Rank, Timestamp: ts}
+		c.lru.Add(r.Pubkey, TimeRank{Rank: r.Rank, Timestamp: ts})
 	}
 }
 
@@ -242,9 +253,7 @@ func (c *RankCache) Update(ts time.Time, ranks ...PubRank) {
 // Eviction only runs if enough time has elapsed since the last clean (MaxRefreshInterval/2).
 // Ranks are clamped to [0,1] to ensure valid values.
 func (c *RankCache) updateAndClean(ts time.Time, ranks []PubRank) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
+	// Update ranks
 	for _, r := range ranks {
 		// Clamp rank to valid range [0,1]
 		if r.Rank < 0 {
@@ -252,23 +261,10 @@ func (c *RankCache) updateAndClean(ts time.Time, ranks []PubRank) {
 		} else if r.Rank > 1 {
 			r.Rank = 1
 		}
-		c.ranks[r.Pubkey] = TimeRank{Rank: r.Rank, Timestamp: ts}
+		c.lru.Add(r.Pubkey, TimeRank{Rank: r.Rank, Timestamp: ts})
 	}
 
-	// Only run eviction if enough time has elapsed since last clean
-	now := time.Now()
-	cleanInterval := c.MaxRefreshInterval / 2
-	if now.Sub(c.lastClean) < cleanInterval {
-		return
-	}
-
-	// Perform eviction scan
-	for pk, rank := range c.ranks {
-		if now.Sub(rank.Timestamp) > c.MaxRefreshInterval {
-			delete(c.ranks, pk)
-		}
-	}
-	c.lastClean = now
+	// LRU handles size-based eviction automatically
 }
 
 const MaxPubkeysToRank = 1000
